@@ -1,0 +1,21 @@
+/* Tailwind base layers */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Leaflet map styles */
+@import "leaflet/dist/leaflet.css";
+
+/* Ensure the root takes full viewport height */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+/* Fix Leaflet marker icons in Vite builds */
+.leaflet-default-icon-path {
+  background-image: url("leaflet/dist/images/marker-icon.png");
+}
