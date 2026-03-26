@@ -1,42 +1,65 @@
 /**
- * StatusBar – top strip showing connection state and latest server message.
+ * StatusBar – slim top navigation strip.
+ * Shows brand, live server status, ESP32 count, and last status event.
  */
 
-export default function StatusBar({ connected, statusMsg, gpsPosition }) {
+export default function StatusBar({ connected, statusMsg }) {
   return (
-    <header className="flex items-center justify-between px-6 py-3 bg-robot-panel border-b border-robot-border">
-      {/* Brand */}
-      <div className="flex items-center gap-3">
-        <span className="text-2xl select-none">🌊</span>
-        <span className="text-lg font-bold tracking-wide text-white">
+    <header
+      className="
+        relative z-10 flex items-center justify-between
+        px-5 h-12 shrink-0
+        bg-surface-900/80 backdrop-blur-md
+        border-b border-surface-700/50
+      "
+    >
+      {/* ── Brand ──────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-2.5">
+        {/* Animated water drop logo */}
+        <span className="relative flex h-7 w-7 items-center justify-center">
+          <span
+            className={`
+              absolute inline-flex h-full w-full rounded-full opacity-40
+              ${connected ? "animate-ping bg-cyan-400" : "bg-slate-600"}
+            `}
+          />
+          <span
+            className={`
+              relative inline-flex h-4 w-4 rounded-full
+              ${connected ? "bg-cyan-400" : "bg-slate-600"}
+            `}
+          />
+        </span>
+        <span className="font-semibold tracking-wide text-white text-sm">
           Water Cleaning Robot
+        </span>
+        <span className="hidden sm:inline text-surface-600 text-xs font-mono">
+          v1.0
         </span>
       </div>
 
-      {/* Status message */}
-      <p className="hidden sm:block text-sm text-slate-400 truncate max-w-xs">
+      {/* ── Centre: last status message ────────────────────────────── */}
+      <p className="hidden md:block absolute left-1/2 -translate-x-1/2 text-xs text-surface-600 truncate max-w-xs text-center">
         {statusMsg}
       </p>
 
-      {/* Indicators */}
-      <div className="flex items-center gap-4">
-        {/* GPS indicator */}
-        {gpsPosition && (
-          <span className="hidden md:flex items-center gap-1 text-xs text-slate-400 font-mono">
-            📍 {gpsPosition.lat.toFixed(5)}, {gpsPosition.lng.toFixed(5)}
-          </span>
-        )}
-
-        {/* WS connection dot */}
-        <span className="flex items-center gap-2 text-sm font-medium">
+      {/* ── Right: connection pill ──────────────────────────────────── */}
+      <div className="flex items-center gap-2">
+        <span
+          className={`
+            flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium
+            border transition-colors duration-300
+            ${connected
+              ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+              : "bg-red-500/10   border-red-500/30   text-red-400"}
+          `}
+        >
           <span
-            className={`h-2.5 w-2.5 rounded-full ${
-              connected ? "bg-robot-success animate-pulse" : "bg-robot-danger"
+            className={`h-1.5 w-1.5 rounded-full ${
+              connected ? "bg-emerald-400 animate-pulse-slow" : "bg-red-400"
             }`}
           />
-          <span className={connected ? "text-robot-success" : "text-robot-danger"}>
-            {connected ? "Online" : "Offline"}
-          </span>
+          {connected ? "Server Online" : "Disconnected"}
         </span>
       </div>
     </header>

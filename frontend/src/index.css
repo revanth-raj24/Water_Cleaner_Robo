@@ -1,10 +1,10 @@
+/* Leaflet map styles – must come before @tailwind directives */
+@import "leaflet/dist/leaflet.css";
+
 /* Tailwind base layers */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-/* Leaflet map styles */
-@import "leaflet/dist/leaflet.css";
 
 /* Ensure the root takes full viewport height */
 html,
