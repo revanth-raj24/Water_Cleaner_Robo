@@ -1,333 +1,272 @@
-/**
- * Water Cleaning Robot – ESP32 Main Controller
- * =============================================
- * Role   : WebSocket CLIENT (slave)
- * Server : FastAPI backend (WebSocket SERVER / master)
+/*
+ * Water Cleaning Robot - ESP32 Firmware
+ * Control: WebSocket only (no physical buttons)
+ * Components:
+ *   - L298N Motor Driver (digital only, no PWM)
+ *   - Questar GPS Module (UART2, RX=16, TX=17)
+ *   - Active-LOW Relay (conveyor belt, GPIO 19)
  *
- * Hardware wired:
- *   L298N Motor Driver  → two DC drive motors (Left + Right)
- *   Relay module        → conveyor belt motor
- *   Questar GPS module  → UART2 (RX2 = GPIO16, TX2 = GPIO17)
- *
- * Required Arduino libraries (install via Library Manager):
- *   - ArduinoWebsockets  by Gil Maimon   (search "ArduinoWebsockets")
- *   - TinyGPS++          by Mikal Hart   (search "TinyGPSPlus")
- *   - ArduinoJson        by Benoit Blanchon (search "ArduinoJson")
+ * Libraries (install via Arduino Library Manager):
+ *   - WebSockets  by Markus Sattler
+ *   - TinyGPSPlus by Mikal Hart
+ *   - ArduinoJson by Benoit Blanchon
  */
 
 #include <WiFi.h>
-#include <ArduinoWebsockets.h>
-#include <ArduinoJson.h>
+#include <WebSocketsClient.h>
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
+#include <ArduinoJson.h>
 
-using namespace websockets;
+// ─────────────────────────────────────────────────────────────────────────────
+//  EDIT THESE 3 LINES
+// ─────────────────────────────────────────────────────────────────────────────
+const char* WIFI_SSID     = "Projects";
+const char* WIFI_PASSWORD = "12345678@";
+const char* SERVER_IP     = "192.168.1.26";   // Your laptop IP
+const int   SERVER_PORT   = 8000;
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ── PLACEHOLDERS – edit before flashing ────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── L298N Motor Pins ─────────────────────────────────────────────────────────
+// Tie ENA and ENB to 5V (use the onboard jumpers on L298N board)
+#define IN1  13   // Left  motors forward
+#define IN2  12   // Left  motors backward
+#define IN3  14   // Right motors forward
+#define IN4  27   // Right motors backward
 
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";      // ← replace
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";  // ← replace
+// ─── Relay (Active LOW) ───────────────────────────────────────────────────────
+#define RELAY_PIN 15   // LOW = belt ON,  HIGH = belt OFF
 
-// LAN IP of the machine running the FastAPI backend.
-// Run `ipconfig` (Windows) or `ip addr` (Linux) to find it.
-const char* SERVER_HOST = "192.168.1.100";         // ← replace
-const uint16_t SERVER_PORT = 8000;
-const char* SERVER_PATH = "/ws/esp32";
+// ─── GPS on UART2 ─────────────────────────────────────────────────────────────
+#define GPS_RX   16
+#define GPS_TX   17
+#define GPS_BAUD 9600
 
-// Set to 1 to generate fake GPS data (useful when no GPS module is wired)
-#define GPS_SIMULATE 0
+HardwareSerial GPSSerial(2);
+TinyGPSPlus    gps;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ── GPIO PIN MAP ────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Left motor  (L298N channel A)
-#define MOTOR_L_ENA  12   // PWM speed
-#define MOTOR_L_IN1  14   // direction
-#define MOTOR_L_IN2  27   // direction
-
-// Right motor (L298N channel B)
-#define MOTOR_R_ENB  26   // PWM speed
-#define MOTOR_R_IN3  25   // direction
-#define MOTOR_R_IN4  33   // direction
-
-// Conveyor belt relay (active HIGH)
-#define CONVEYOR_PIN 32
-
-// GPS UART2
-#define GPS_RX_PIN   16
-#define GPS_TX_PIN   17
-#define GPS_BAUD     9600
-
-// Motor PWM (0–255)
-#define MOTOR_SPEED  200
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ── GLOBALS ─────────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-
-WebsocketsClient wsClient;
-TinyGPSPlus      gps;
-HardwareSerial   gpsSerial(2);   // UART2
-
+// ─── WebSocket ────────────────────────────────────────────────────────────────
+WebSocketsClient ws;
 bool wsConnected = false;
 
-// GPS send interval
-unsigned long lastGpsSend    = 0;
-const unsigned long GPS_INTERVAL_MS = 2000;
+// ─── State ────────────────────────────────────────────────────────────────────
+bool   beltOn         = false;
+String currentCommand = "STOP";
 
-// Reconnect timing
-unsigned long lastReconnectAttempt = 0;
-const unsigned long RECONNECT_INTERVAL_MS = 5000;
+// ─── GPS timer (10 seconds) ───────────────────────────────────────────────────
+unsigned long lastGPSSend    = 0;
+const unsigned long GPS_INTERVAL = 10000;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ── MOTOR HELPERS ───────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-
-void motorsStop() {
-  digitalWrite(MOTOR_L_IN1, LOW);  digitalWrite(MOTOR_L_IN2, LOW);
-  digitalWrite(MOTOR_R_IN3, LOW);  digitalWrite(MOTOR_R_IN4, LOW);
-  analogWrite(MOTOR_L_ENA, 0);
-  analogWrite(MOTOR_R_ENB, 0);
-}
-
-void motorsForward() {
-  digitalWrite(MOTOR_L_IN1, HIGH); digitalWrite(MOTOR_L_IN2, LOW);
-  digitalWrite(MOTOR_R_IN3, HIGH); digitalWrite(MOTOR_R_IN4, LOW);
-  analogWrite(MOTOR_L_ENA, MOTOR_SPEED);
-  analogWrite(MOTOR_R_ENB, MOTOR_SPEED);
-}
-
-void motorsBackward() {
-  digitalWrite(MOTOR_L_IN1, LOW);  digitalWrite(MOTOR_L_IN2, HIGH);
-  digitalWrite(MOTOR_R_IN3, LOW);  digitalWrite(MOTOR_R_IN4, HIGH);
-  analogWrite(MOTOR_L_ENA, MOTOR_SPEED);
-  analogWrite(MOTOR_R_ENB, MOTOR_SPEED);
-}
-
-void motorsLeft() {
-  // Pivot left: right wheel forward, left wheel backward
-  digitalWrite(MOTOR_L_IN1, LOW);  digitalWrite(MOTOR_L_IN2, HIGH);
-  digitalWrite(MOTOR_R_IN3, HIGH); digitalWrite(MOTOR_R_IN4, LOW);
-  analogWrite(MOTOR_L_ENA, MOTOR_SPEED);
-  analogWrite(MOTOR_R_ENB, MOTOR_SPEED);
-}
-
-void motorsRight() {
-  // Pivot right: left wheel forward, right wheel backward
-  digitalWrite(MOTOR_L_IN1, HIGH); digitalWrite(MOTOR_L_IN2, LOW);
-  digitalWrite(MOTOR_R_IN3, LOW);  digitalWrite(MOTOR_R_IN4, HIGH);
-  analogWrite(MOTOR_L_ENA, MOTOR_SPEED);
-  analogWrite(MOTOR_R_ENB, MOTOR_SPEED);
-}
-
-void conveyorOn()  { digitalWrite(CONVEYOR_PIN, HIGH); }
-void conveyorOff() { digitalWrite(CONVEYOR_PIN, LOW);  }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ── COMMAND HANDLER ─────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-
-void handleCommand(const String& command) {
-  Serial.print("[CMD] ");
-  Serial.println(command);
-
-  if      (command == "forward")      motorsForward();
-  else if (command == "backward")     motorsBackward();
-  else if (command == "left")         motorsLeft();
-  else if (command == "right")        motorsRight();
-  else if (command == "stop")         motorsStop();
-  else if (command == "conveyor_on")  conveyorOn();
-  else if (command == "conveyor_off") conveyorOff();
-  else {
-    Serial.print("[WARN] Unknown command: ");
-    Serial.println(command);
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ── WEBSOCKET CALLBACKS ─────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-
-void onWsMessage(WebsocketsMessage msg) {
-  Serial.print("[WS RX] ");
-  Serial.println(msg.data());
-
-  StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, msg.data());
-  if (err) {
-    Serial.print("[ERR] JSON parse failed: ");
-    Serial.println(err.c_str());
-    return;
-  }
-
-  const char* type = doc["type"];
-  if (strcmp(type, "control") == 0) {
-    handleCommand(String((const char*)doc["command"]));
-  }
-}
-
-void onWsEvent(WebsocketsEvent event, String data) {
-  switch (event) {
-    case WebsocketsEvent::ConnectionOpened:
-      Serial.println("[WS] Connected to server");
-      wsConnected = true;
-      // Announce ourselves
-      wsClient.send("{\"type\":\"status\",\"message\":\"ESP32 robot online\"}");
-      break;
-
-    case WebsocketsEvent::ConnectionClosed:
-      Serial.println("[WS] Disconnected from server");
-      wsConnected = false;
-      motorsStop();     // safety: halt motors on disconnect
-      conveyorOff();
-      break;
-
-    case WebsocketsEvent::GotPing:
-      wsClient.sendPong();
-      break;
-
-    default:
-      break;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ── WEBSOCKET CONNECT ───────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-
-bool connectWebSocket() {
-  Serial.printf("[WS] Connecting to ws://%s:%d%s …\n",
-                SERVER_HOST, SERVER_PORT, SERVER_PATH);
-
-  String url = String("ws://") + SERVER_HOST + ":" +
-               String(SERVER_PORT) + SERVER_PATH;
-
-  wsClient.onMessage(onWsMessage);
-  wsClient.onEvent(onWsEvent);
-
-  bool ok = wsClient.connect(SERVER_HOST, SERVER_PORT, SERVER_PATH);
-  if (!ok) {
-    Serial.println("[WS] Connection failed");
-  }
-  return ok;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ── GPS HELPERS ─────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-
-#if GPS_SIMULATE
-// Simulate a slow GPS drift for testing purposes
-float simLat = 13.08270f;
-float simLng = 80.27070f;
-
-void sendSimulatedGPS() {
-  simLat += 0.00001f * random(-3, 4);
-  simLng += 0.00001f * random(-3, 4);
-
-  StaticJsonDocument<128> doc;
-  doc["type"] = "gps";
-  doc["lat"]  = simLat;
-  doc["lng"]  = simLng;
-
-  String payload;
-  serializeJson(doc, payload);
-  wsClient.send(payload);
-  Serial.print("[GPS SIM] "); Serial.println(payload);
-}
-#endif
-
-void sendRealGPS() {
-  if (!gps.location.isValid()) return;
-
-  StaticJsonDocument<128> doc;
-  doc["type"] = "gps";
-  doc["lat"]  = gps.location.lat();
-  doc["lng"]  = gps.location.lng();
-
-  String payload;
-  serializeJson(doc, payload);
-  wsClient.send(payload);
-  Serial.print("[GPS] "); Serial.println(payload);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ── SETUP ───────────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-
+// ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Water Cleaning Robot Controller ===");
+  Serial.println("\n=== Water Cleaning Robot ===");
 
   // Motor pins
-  pinMode(MOTOR_L_ENA, OUTPUT); pinMode(MOTOR_L_IN1, OUTPUT);
-  pinMode(MOTOR_L_IN2, OUTPUT); pinMode(MOTOR_R_ENB, OUTPUT);
-  pinMode(MOTOR_R_IN3, OUTPUT); pinMode(MOTOR_R_IN4, OUTPUT);
-  motorsStop();
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  stopMotors();
 
-  // Conveyor
-  pinMode(CONVEYOR_PIN, OUTPUT);
-  conveyorOff();
+  // Relay — start with belt OFF (active LOW, so HIGH = OFF)
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
 
-  // GPS UART
-#if !GPS_SIMULATE
-  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  Serial.println("[GPS] Serial started");
-#else
-  Serial.println("[GPS] Simulation mode ON");
-  randomSeed(analogRead(0));
-#endif
+  // GPS
+  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("GPS serial started on UART2");
 
   // WiFi
-  Serial.printf("[WiFi] Connecting to %s …\n", WIFI_SSID);
+  connectWiFi();
+
+  // WebSocket — connects to ws://SERVER_IP:8000/ws/esp32
+  ws.begin(SERVER_IP, SERVER_PORT, "/ws/esp32");
+  ws.onEvent(onWebSocketEvent);
+  ws.setReconnectInterval(3000);
+  Serial.println("WebSocket connecting...");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void loop() {
+  ws.loop();   // handles connect, reconnect, ping/pong
+
+  // Feed GPS parser
+  while (GPSSerial.available() > 0) {
+    gps.encode(GPSSerial.read());
+  }
+
+  // Send GPS every 10 seconds
+  if (millis() - lastGPSSend >= GPS_INTERVAL) {
+    sendGPS();
+    lastGPSSend = millis();
+  }
+}
+
+// ─── WiFi ─────────────────────────────────────────────────────────────────────
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.printf("\n[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
-
-  // WebSocket
-  connectWebSocket();
+  Serial.println();
+  Serial.print("Connected! ESP32 IP: ");
+  Serial.println(WiFi.localIP());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ── LOOP ────────────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Motor Control ────────────────────────────────────────────────────────────
+void moveForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  currentCommand = "FORWARD";
+  Serial.println("Motor >> FORWARD");
+}
 
-void loop() {
-  // ── Feed GPS data to TinyGPS++ ──────────────────────────────────────────
-#if !GPS_SIMULATE
-  while (gpsSerial.available()) {
-    gps.encode(gpsSerial.read());
-  }
-#endif
+void moveBackward() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  currentCommand = "BACKWARD";
+  Serial.println("Motor >> BACKWARD");
+}
 
-  // ── Maintain WebSocket connection ───────────────────────────────────────
+void turnLeft() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  currentCommand = "LEFT";
+  Serial.println("Motor >> LEFT");
+}
+
+void turnRight() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  currentCommand = "RIGHT";
+  Serial.println("Motor >> RIGHT");
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  currentCommand = "STOP";
+  Serial.println("Motor >> STOP");
+}
+
+// ─── Belt ─────────────────────────────────────────────────────────────────────
+void setBelt(bool on) {
+  beltOn = on;
+  digitalWrite(RELAY_PIN, on ? LOW : HIGH);  // Active LOW
+  Serial.print("Belt >> ");
+  Serial.println(on ? "ON (relay LOW)" : "OFF (relay HIGH)");
+
+  // Immediately echo belt state back to server
   if (wsConnected) {
-    wsClient.poll();   // process incoming messages / keep-alive
-  } else {
-    unsigned long now = millis();
-    if (now - lastReconnectAttempt > RECONNECT_INTERVAL_MS) {
-      lastReconnectAttempt = now;
-      Serial.println("[WS] Attempting reconnect …");
-      connectWebSocket();
-    }
+    StaticJsonDocument<96> doc;
+    doc["type"]    = "belt_status";
+    doc["belt_on"] = beltOn;
+    String msg;
+    serializeJson(doc, msg);
+    ws.sendTXT(msg);
+  }
+}
+
+// ─── Send GPS over WebSocket ──────────────────────────────────────────────────
+void sendGPS() {
+  if (!wsConnected) {
+    Serial.println("GPS skipped — not connected");
+    return;
   }
 
-  // ── Send GPS position periodically ─────────────────────────────────────
-  if (wsConnected) {
-    unsigned long now = millis();
-    if (now - lastGpsSend >= GPS_INTERVAL_MS) {
-      lastGpsSend = now;
-#if GPS_SIMULATE
-      sendSimulatedGPS();
-#else
-      sendRealGPS();
-#endif
+  double lat = gps.location.isValid() ? gps.location.lat() : 0.0;
+  double lng = gps.location.isValid() ? gps.location.lng() : 0.0;
+  int    sat = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+  bool   fix = gps.location.isValid();
+
+  StaticJsonDocument<160> doc;
+  doc["type"]       = "gps";
+  doc["lat"]        = serialized(String(lat, 6));
+  doc["lng"]        = serialized(String(lng, 6));
+  doc["satellites"] = sat;
+  doc["fix"]        = fix;
+
+  String msg;
+  serializeJson(doc, msg);
+  ws.sendTXT(msg);
+
+  Serial.printf("GPS >> lat=%.6f  lng=%.6f  sats=%d  fix=%s\n",
+                lat, lng, sat, fix ? "YES" : "NO");
+}
+
+// ─── Send status echo to server ───────────────────────────────────────────────
+void sendStatus() {
+  if (!wsConnected) return;
+  StaticJsonDocument<128> doc;
+  doc["type"]    = "status";
+  doc["command"] = currentCommand;
+  doc["belt_on"] = beltOn;
+  String msg;
+  serializeJson(doc, msg);
+  ws.sendTXT(msg);
+}
+
+// ─── WebSocket Event Handler ──────────────────────────────────────────────────
+void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+
+    case WStype_CONNECTED:
+      wsConnected = true;
+      Serial.println("WebSocket CONNECTED");
+      sendStatus();   // send current state to server on connect
+      sendGPS();      // send GPS immediately on connect
+      break;
+
+    case WStype_DISCONNECTED:
+      wsConnected = false;
+      Serial.println("WebSocket DISCONNECTED — retrying...");
+      stopMotors();   // safety: stop if connection lost
+      break;
+
+    case WStype_TEXT: {
+      Serial.print("WS received: ");
+      Serial.println((char*)payload);
+
+      StaticJsonDocument<200> doc;
+      DeserializationError err = deserializeJson(doc, payload, length);
+      if (err) {
+        Serial.print("JSON error: ");
+        Serial.println(err.c_str());
+        break;
+      }
+
+      String msgType = doc["type"] | "";
+
+      // ── Movement / belt command from dashboard ──
+      // Frontend sends: { "type": "control", "command": "forward|backward|left|right|stop|conveyor_on|conveyor_off" }
+      if (msgType == "control") {
+        String cmd = doc["command"] | "STOP";
+        cmd.toUpperCase();
+
+        if      (cmd == "FORWARD")      moveForward();
+        else if (cmd == "BACKWARD")     moveBackward();
+        else if (cmd == "LEFT")         turnLeft();
+        else if (cmd == "RIGHT")        turnRight();
+        else if (cmd == "CONVEYOR_ON")  setBelt(true);
+        else if (cmd == "CONVEYOR_OFF") setBelt(false);
+        else                            stopMotors();
+
+        sendStatus();  // echo back so dashboard confirms
+      }
+
+      break;
     }
+
+    case WStype_PING:
+    case WStype_PONG:
+      break;  // handled automatically by the library
+
+    case WStype_ERROR:
+      Serial.println("WS error");
+      break;
+
+    default:
+      break;
   }
 }

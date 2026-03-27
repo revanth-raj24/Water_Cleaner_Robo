@@ -1,0 +1,16 @@
+# AI traces
+claude.md
+.ai/
+prompts/
+.claude/
+
+# Python / ML
+__pycache__/
+*.pyc
+*.joblib
+
+# Node
+node_modules/
+
+# Env
+.env
